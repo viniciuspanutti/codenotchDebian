@@ -18,16 +18,7 @@ use std::os::windows::ffi::OsStrExt;
 /// Discover installed official Antigravity CLI (`agy.exe`).
 /// Checks `%LOCALAPPDATA%\agy\bin\agy.exe` and `PATH` only (only `.exe` binaries).
 pub fn find_agy() -> Option<PathBuf> {
-    if let Some(local) = dirs::data_local_dir() {
-        let candidate = local.join("agy").join("bin").join("agy.exe");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        return find_agy_in(&std::env::split_paths(&path_var).filter(|p| p.is_absolute()).collect::<Vec<_>>());
-    }
-    None
+    crate::cli_discovery::find_agy_cli()
 }
 
 /// Helper for testing discovery in explicit directories without touching environment.
@@ -96,7 +87,9 @@ fn sanitize_terminal_output(input: &str) -> String {
 /// Returns an error on invalid or unrecognized format; never returns dummy 0% quotas.
 fn parse_quota(text: &str) -> Result<Vec<LimitWindow>, String> {
     let clean = sanitize_terminal_output(text);
-    if !clean.lines().any(|line| line.trim() == "Quota:") {
+    let has_quota_header = clean.lines().any(|line| line.trim() == "Quota:");
+    let has_limit_rows = clean.lines().any(|line| line.contains("Limit Remaining"));
+    if !has_quota_header && !has_limit_rows {
         return Err("CLI did not return a quota report".into());
     }
     let mut out = Vec::new();
@@ -139,7 +132,7 @@ fn parse_quota(text: &str) -> Result<Vec<LimitWindow>, String> {
             label: lane.map_or(short_label, String::from),
             group,
             id: label,
-            used: ((100.0 - remaining) / 100.0).clamp(0.0, 1.0),
+            used: ((100.0f64 - remaining) / 100.0f64).clamp(0.0f64, 1.0f64),
             resets_at: Some(reset as u64),
             ..Default::default()
         });
@@ -482,21 +475,56 @@ fn run_cmd_conpty(
 }
 
 #[cfg(not(windows))]
-fn run_cmd_conpty(
-    _program: &Path,
-    _args: &[&str],
-    _cwd: Option<&Path>,
-    _timeout: Duration,
+fn run_cmd_platform(
+    program: &Path,
+    args: &[&str],
+    cwd: Option<&Path>,
+    timeout: Duration,
 ) -> Result<String, String> {
-    Err("Antigravity CLI runner requires Windows".into())
+    use std::io::Read;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args);
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|e| format!("Failed to spawn {}: {e}", program.display()))?;
+    let stdout = child.stdout.take().ok_or("Failed to capture CLI output")?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.take(65536).read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(raw_bytes) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let text = String::from_utf8_lossy(&raw_bytes);
+            Ok(sanitize_terminal_output(&text))
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err("CLI execution timed out".into())
+        }
+    }
 }
 
-/// Executes official `agy --print /usage` via native ConPTY.
+/// Executes official `agy --print /usage`.
 pub fn read_quota() -> Result<Vec<LimitWindow>, String> {
     let agy = find_agy().ok_or("Antigravity CLI is not installed")?;
     let dir = crate::config::config_path().with_file_name("quota-work");
     std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create CLI working directory: {e}"))?;
+    #[cfg(windows)]
     let output = run_cmd_conpty(&agy, &["--sandbox", "--print-timeout", "30s", "--print", "/usage"], Some(&dir), Duration::from_secs(70))?;
+    #[cfg(not(windows))]
+    let output = run_cmd_platform(&agy, &["--sandbox", "--print-timeout", "30s", "--print", "/usage"], Some(&dir), Duration::from_secs(70))?;
     parse_quota(&output)
 }
 

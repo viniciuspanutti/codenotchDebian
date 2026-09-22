@@ -97,41 +97,8 @@ fn persist(s: &UsageSnapshot) {
 // ---------------- Locating the executable ----------------
 
 /// Candidates in order: the native exe inside the global npm package (cleanest — no cmd/node
-/// wrapper) → ~/.codex/bin → codex.exe / codex.cmd on PATH.
 pub fn find_executable() -> Option<PathBuf> {
-    let mut cands: Vec<PathBuf> = Vec::new();
-    if let Some(appdata) = dirs::config_dir() {
-        let pkg = appdata.join("npm").join("node_modules").join("@openai").join("codex");
-        if let Ok(rd) = std::fs::read_dir(pkg.join("bin")) {
-            for e in rd.flatten() {
-                let n = e.file_name().to_string_lossy().to_lowercase();
-                if n.starts_with("codex-") && n.contains("windows") && n.ends_with(".exe") {
-                    cands.push(e.path());
-                }
-            }
-        }
-        if let Ok(rd) = std::fs::read_dir(pkg.join("vendor")) {
-            // Newer packages keep the native exe at vendor/<triple>/codex/codex.exe
-            for e in rd.flatten() {
-                let p = e.path().join("codex").join("codex.exe");
-                if p.exists() {
-                    cands.push(p);
-                }
-            }
-        }
-        cands.push(appdata.join("npm").join("codex.cmd"));
-    }
-    if let Some(h) = codex_home() {
-        cands.push(h.join("bin").join("codex.exe"));
-        cands.push(h.join("bin").join("codex"));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            cands.push(dir.join("codex.exe"));
-            cands.push(dir.join("codex.cmd"));
-        }
-    }
-    cands.into_iter().find(|p| p.is_file())
+    crate::cli_discovery::find_codex_cli()
 }
 
 // ---------------- Live: the usage endpoint ----------------
@@ -511,14 +478,21 @@ pub fn snapshot_from_rollout(text: &str) -> Option<(Vec<LimitWindow>, Option<u64
 /// Prefer the installed native Codex client: it understands the desktop's managed sign-in.
 /// Only initialize + account/rateLimits/read are sent; no login or inference commands.
 fn native_codex() -> Option<PathBuf> {
-    if let Some(local) = dirs::data_local_dir() {
-        let mut bins = list_dirs(&local.join("OpenAI/Codex/bin"));
-        bins.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).and_then(|m| m.modified()).ok()));
-        if let Some(exe) = bins.into_iter().map(|p| p.join("codex.exe")).find(|p| p.is_file()) {
-            return Some(exe);
+    #[cfg(windows)]
+    {
+        if let Some(local) = dirs::data_local_dir() {
+            let mut bins = list_dirs(&local.join("OpenAI/Codex/bin"));
+            bins.sort_by_key(|p| std::cmp::Reverse(std::fs::metadata(p).and_then(|m| m.modified()).ok()));
+            if let Some(exe) = bins.into_iter().map(|p| p.join("codex.exe")).find(|p| p.is_file()) {
+                return Some(exe);
+            }
         }
+        find_executable().filter(|p| p.extension().and_then(|x| x.to_str()) == Some("exe"))
     }
-    find_executable().filter(|p| p.extension().and_then(|x| x.to_str()) == Some("exe"))
+    #[cfg(not(windows))]
+    {
+        find_executable()
+    }
 }
 
 fn app_server_snapshot(result: &serde_json::Value) -> Option<UsageSnapshot> {

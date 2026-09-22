@@ -1,0 +1,14 @@
+[Unit]
+Description=Codenotch IDE Watcher
+Documentation=https://github.com/viniciuspanutti/codenotchDebian
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codenotch-ide-watch
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=default.target

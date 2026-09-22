@@ -9,3 +9,15 @@ xcuserdata/
 .swiftpm/
 .agents/
 .forgeguard/
+
+# Rust / Linux build artifacts
+target/
+windows/target/
+
+# Linux packages
+*.deb
+*.AppImage
+
+# Runtime/debug logs
+run.log
+*.log

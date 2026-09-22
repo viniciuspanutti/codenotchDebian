@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+Codenotch IDE Watcher Daemon for Linux
+Monitors configured IDEs (Cursor, Antigravity, VS Code, etc.) and starts or stops
+Codenotch accordingly, with full support for manual pauses and zero-CPU idle polling.
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "codenotch"
+IDE_CONFIG_FILE = CONFIG_DIR / "ide_watch.json"
+STATE_FILE = CONFIG_DIR / "watch_state.json"
+PID_FILE = CONFIG_DIR / "codenotch.pid"
+
+DEFAULT_IDE_CONFIG = {
+    "interval_seconds": 3,
+    "ides": [
+        {
+            "name": "Cursor",
+            "executables": ["/usr/share/cursor/cursor"],
+            "process_names": ["cursor"]
+        },
+        {
+            "name": "Antigravity",
+            "executables": ["/opt/antigravity/antigravity"],
+            "process_names": ["antigravity"]
+        },
+        {
+            "name": "VS Code",
+            "executables": ["/usr/share/code/code"],
+            "process_names": ["code"]
+        }
+    ]
+}
+
+running = True
+
+def handle_sigterm(signum, frame):
+    global running
+    print(f"[codenotch-ide-watch] Caught signal {signum}, stopping...", flush=True)
+    running = False
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)
+
+def ensure_config():
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not IDE_CONFIG_FILE.exists():
+        try:
+            with open(IDE_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(DEFAULT_IDE_CONFIG, f, indent=2)
+        except Exception as e:
+            print(f"[codenotch-ide-watch] Warning: Could not write default config: {e}", flush=True)
+
+def load_ide_config():
+    ensure_config()
+    try:
+        with open(IDE_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data
+    except Exception as e:
+        print(f"[codenotch-ide-watch] Warning: error reading {IDE_CONFIG_FILE}, using defaults: {e}", flush=True)
+        return DEFAULT_IDE_CONFIG
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {"paused": False, "stopped_ides": []}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"paused": False, "stopped_ides": []}
+
+def save_state(state):
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"[codenotch-ide-watch] Error saving state: {e}", flush=True)
+
+def find_codenotch_pid():
+    my_uid = os.getuid()
+    # Check pid file first
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            exe = os.readlink(f"/proc/{pid}/exe")
+            if "codenotch" in os.path.basename(exe):
+                return pid
+        except Exception:
+            pass
+
+    # Scan /proc safely for processes owned by user
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            p_stat = os.stat(f"/proc/{pid}")
+            if p_stat.st_uid != my_uid:
+                continue
+            exe = os.readlink(f"/proc/{pid}/exe")
+            if os.path.basename(exe) == "codenotch":
+                # Update PID file
+                PID_FILE.write_text(str(pid))
+                return pid
+        except Exception:
+            continue
+    return None
+
+def find_running_ides(ide_configs):
+    my_uid = os.getuid()
+    running_ides = set()
+    my_pid = os.getpid()
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == my_pid:
+            continue
+        try:
+            p_stat = os.stat(f"/proc/{pid}")
+            if p_stat.st_uid != my_uid:
+                continue
+            exe = os.readlink(f"/proc/{pid}/exe")
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+
+        exe_base = os.path.basename(exe)
+        for ide in ide_configs:
+            name = ide["name"]
+            configured_exes = ide.get("executables", [])
+            configured_names = ide.get("process_names", [])
+
+            if exe in configured_exes:
+                running_ides.add(name)
+            elif exe_base in configured_names or comm in configured_names:
+                running_ides.add(name)
+
+    return sorted(list(running_ides))
+
+def resolve_codenotch_binary():
+    # 1. Environment variable override
+    env_bin = os.environ.get("CODENOTCH_BIN")
+    if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        return env_bin
+
+    # 2. Config file override
+    custom_bin_file = CONFIG_DIR / "binary_path"
+    if custom_bin_file.exists():
+        custom_path = custom_bin_file.read_text().strip()
+        if os.path.isfile(custom_path) and os.access(custom_path, os.X_OK):
+            return custom_path
+
+    # 3. User local bin
+    user_bin = Path.home() / ".local" / "bin" / "codenotch"
+    if user_bin.exists() and os.access(user_bin, os.X_OK):
+        return str(user_bin.resolve())
+
+    # 4. PATH lookup
+    import shutil
+    path_bin = shutil.which("codenotch")
+    if path_bin:
+        return path_bin
+
+    # 5. Local project workspace paths
+    known_paths = [
+        Path.home() / "Documents/pessoal/Projetos_Github/AppConsumoIA/codenotchDebian/windows/target/release/codenotch",
+        Path.home() / "Documents/pessoal/Projetos_Github/AppConsumoIA/codenotchDebian/windows/target/debug/codenotch",
+    ]
+    for p in known_paths:
+        if p.exists() and os.access(p, os.X_OK):
+            return str(p)
+
+    return None
+
+def start_codenotch():
+    if find_codenotch_pid():
+        return True
+
+    bin_path = resolve_codenotch_binary()
+    if not bin_path:
+        print("[codenotch-ide-watch] Error: codenotch binary not found!", flush=True)
+        return False
+
+    print(f"[codenotch-ide-watch] Starting Codenotch: {bin_path}", flush=True)
+    env = os.environ.copy()
+    # Ensure display vars if missing from systemd environment
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+    if "WAYLAND_DISPLAY" not in env and os.path.exists(f"/run/user/{os.getuid()}/wayland-0"):
+        env["WAYLAND_DISPLAY"] = "wayland-0"
+
+    try:
+        proc = subprocess.Popen(
+            [bin_path],
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL
+        )
+        PID_FILE.write_text(str(proc.pid))
+        print(f"[codenotch-ide-watch] Codenotch started (PID: {proc.pid})", flush=True)
+        return True
+    except Exception as e:
+        print(f"[codenotch-ide-watch] Failed to start Codenotch: {e}", flush=True)
+        return False
+
+def stop_codenotch():
+    pid = find_codenotch_pid()
+    if not pid:
+        return True
+
+    print(f"[codenotch-ide-watch] Terminating Codenotch (PID: {pid})...", flush=True)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(25): # wait up to 2.5 seconds
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+        else:
+            print(f"[codenotch-ide-watch] Process {pid} did not exit after SIGTERM, sending SIGKILL...", flush=True)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        print(f"[codenotch-ide-watch] Error stopping Codenotch: {e}", flush=True)
+
+    if PID_FILE.exists():
+        try:
+            PID_FILE.unlink()
+        except Exception:
+            pass
+
+    print("[codenotch-ide-watch] Codenotch stopped", flush=True)
+    return True
+
+def main():
+    print("[codenotch-ide-watch] Service started.", flush=True)
+    ensure_config()
+
+    while running:
+        config = load_ide_config()
+        interval = max(1, int(config.get("interval_seconds", 3)))
+        ides_config = config.get("ides", [])
+
+        state = load_state()
+        paused = state.get("paused", False)
+        stopped_ides = set(state.get("stopped_ides", []))
+
+        running_ides = set(find_running_ides(ides_config))
+
+        # Check if all IDEs have closed
+        if not running_ides:
+            # If all IDEs closed, clear temporary stopped_ides suppression
+            if stopped_ides:
+                state["stopped_ides"] = []
+                save_state(state)
+                stopped_ides = set()
+
+            # Ensure Codenotch is closed when no IDEs are open
+            c_pid = find_codenotch_pid()
+            if c_pid:
+                print(f"[codenotch-ide-watch] No IDEs running. Closing Codenotch (PID: {c_pid}).", flush=True)
+                stop_codenotch()
+
+        else:
+            # At least one IDE is running
+            # Check if current running IDEs are still suppressed by manual stop
+            # If user opened a new IDE that wasn't in stopped_ides, we resume
+            active_unsuppressed = running_ides - stopped_ides
+
+            if paused:
+                # Explicit pause: do nothing
+                pass
+            elif not active_unsuppressed:
+                # All currently active IDEs were specifically stopped by user
+                pass
+            else:
+                # We have active, unsuppressed IDEs!
+                c_pid = find_codenotch_pid()
+                if not c_pid:
+                    print(f"[codenotch-ide-watch] Detected active IDEs: {sorted(list(running_ides))}. Starting Codenotch.", flush=True)
+                    start_codenotch()
+
+        # Clean sleep
+        slept = 0
+        while running and slept < interval:
+            time.sleep(0.5)
+            slept += 0.5
+
+    print("[codenotch-ide-watch] Service stopped cleanly.", flush=True)
+
+if __name__ == "__main__":
+    main()

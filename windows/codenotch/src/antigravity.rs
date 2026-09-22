@@ -109,7 +109,7 @@ pub fn load_persisted() -> UsageSnapshot {
             .ok()
             .and_then(|s| serde_json::from_str::<UsageSnapshot>(&s).ok())
             .unwrap_or_default();
-        if !snap.note.starts_with("via Antigravity CLI") {
+        if !snap.note.starts_with("via Antigravity") {
             snap = UsageSnapshot::default();
         }
         snap.status = if snap.windows.is_empty() {
@@ -121,7 +121,7 @@ pub fn load_persisted() -> UsageSnapshot {
         }
         .into();
         if snap.windows.is_empty() {
-            snap.note = "Waiting for Antigravity CLI quota".into();
+            snap.note = "Waiting for Antigravity quota".into();
         }
         snap
     } else {
@@ -198,15 +198,37 @@ fn discover() -> Option<Endpoint> {
 #[cfg(not(windows))]
 fn discover() -> Option<Endpoint> {
     let table = run_hidden("ps", &["-Ao", "pid,command"]);
-    let line = table.lines().find(|l| l.contains("language_server") && l.contains("--csrf_token"))?;
+    let line = table
+        .lines()
+        .filter(|l| !l.contains("grep") && !l.contains("codenotch"))
+        .find(|l| l.contains("language_server") && l.contains("--csrf_token"))?;
     let pid: u32 = line.trim().split_whitespace().next()?.parse().ok()?;
     let csrf = flag_value(line, "--csrf_token")?;
     let out = run_hidden("lsof", &["-nP", "-a", "-p", &pid.to_string(), "-iTCP", "-sTCP:LISTEN"]);
-    let ports: Vec<u16> = out
+    let mut ports: Vec<u16> = out
         .lines()
         .filter_map(|l| l.split_whitespace().rev().find(|w| w.contains(':')))
         .filter_map(|a| a.rsplit(':').next()?.parse().ok())
         .collect();
+
+    if ports.is_empty() {
+        let ss_out = run_hidden("ss", &["-Htlpn"]);
+        let pid_pattern = format!("pid={pid},");
+        for l in ss_out.lines() {
+            if l.contains(&pid_pattern) {
+                if let Some(col) = l.split_whitespace().nth(3) {
+                    if let Some(port_str) = col.rsplit(':').next() {
+                        if let Ok(p) = port_str.parse::<u16>() {
+                            ports.push(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    ports.sort_unstable();
+    ports.dedup();
     if ports.is_empty() {
         return None;
     }
@@ -687,14 +709,17 @@ fn start_cli(app: AppHandle) {
 
         let mut last_attempt: Option<Instant> = None;
 
-        while receiver.recv().is_ok() {
-            if last_attempt.is_some_and(|last| last.elapsed() < CLI_TTL) {
+        loop {
+            let _ = receiver.recv_timeout(Duration::from_secs(POLL_SECS));
+
+            if last_attempt.is_some_and(|last| last.elapsed() < Duration::from_secs(10)) {
                 continue;
             }
             let st = app.state::<AppState>();
             let previous = st.antigravity.lock().unwrap().clone();
             if !previous.windows.is_empty()
                 && now_ms().saturating_sub(previous.fetched_at) < CLI_TTL.as_millis() as u64
+                && last_attempt.is_some_and(|last| last.elapsed() < Duration::from_secs(30))
             {
                 continue;
             }
@@ -708,22 +733,35 @@ fn start_cli(app: AppHandle) {
                     note: "via Antigravity CLI".into(),
                     ..Default::default()
                 },
-                Err(error) => UsageSnapshot {
-                    status: if previous.windows.is_empty() {
-                        "error".into()
-                    } else {
-                        "stale".into()
-                    },
-                    note: format!(
-                        "via Antigravity CLI — {error}.{}",
-                        if previous.windows.is_empty() {
-                            ""
-                        } else {
-                            " Last reading kept."
+                Err(error) => {
+                    let bridge_res = discover().and_then(|ep| bridge_quota(&ep).ok());
+                    if let Some(windows) = bridge_res {
+                        UsageSnapshot {
+                            status: "ok".into(),
+                            windows,
+                            fetched_at: now_ms(),
+                            note: "via Antigravity language server".into(),
+                            ..Default::default()
                         }
-                    ),
-                    ..previous
-                },
+                    } else {
+                        UsageSnapshot {
+                            status: if previous.windows.is_empty() {
+                                "error".into()
+                            } else {
+                                "stale".into()
+                            },
+                            note: format!(
+                                "via Antigravity CLI — {error}.{}",
+                                if previous.windows.is_empty() {
+                                    ""
+                                } else {
+                                    " Last reading kept."
+                                }
+                            ),
+                            ..previous
+                        }
+                    }
+                }
             };
 
             *st.antigravity.lock().unwrap() = snap.clone();
@@ -767,33 +805,61 @@ fn start_legacy(app: AppHandle) {
 
 /// For doctor: contains no secrets
 pub fn probe() -> String {
+    let mut parts = Vec::new();
     if let Some(agy) = crate::agy_cli::find_agy() {
-        format!("Antigravity: official CLI installed at {}", agy.display())
-    } else {
-        legacy_probe()
-    }
-}
-
-fn legacy_probe() -> String {
-    let roots = state_roots();
-    let cred = read_credentials();
-    let ep = discover();
-    format!(
-        "Antigravity: state dirs {} | Credential Manager gemini:antigravity {} | language_server {}",
-        if roots.is_empty() {
-            "none under ~/.gemini".to_string()
-        } else {
-            roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
-        },
-        match cred {
-            Some(c) => format!("found ({}, {})", c.auth_method, if c.expired { "expired" } else { "valid" }),
-            None => "not found".into(),
-        },
-        match ep {
-            Some(e) => format!("running, ports {:?}", e.ports),
-            None => "not running".into(),
+        match crate::agy_cli::read_quota() {
+            Ok(windows) => {
+                let summary = windows
+                    .iter()
+                    .map(|w| {
+                        if let Some(g) = &w.group {
+                            format!("{g} › {}: {:.0}%", w.label, w.used * 100.0)
+                        } else {
+                            format!("{}: {:.0}%", w.label, w.used * 100.0)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("official CLI at {} (quota: [{}])", agy.display(), summary));
+            }
+            Err(e) => {
+                parts.push(format!("official CLI at {} (read error: {e})", agy.display()));
+            }
         }
-    )
+    } else {
+        parts.push("official CLI not found".into());
+    }
+
+    let ep = discover();
+    match ep {
+        Some(e) => match bridge_quota(&e) {
+            Ok(w) => {
+                let summary = w
+                    .iter()
+                    .map(|win| {
+                        if let Some(g) = &win.group {
+                            format!("{g} › {}: {:.0}%", win.label, win.used * 100.0)
+                        } else {
+                            format!("{}: {:.0}%", win.label, win.used * 100.0)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                parts.push(format!("language_server running, ports {:?} (quota: [{}])", e.ports, summary));
+            }
+            Err(err) => {
+                parts.push(format!("language_server running, ports {:?} (RPC error: {err})", e.ports));
+            }
+        },
+        None => parts.push("language_server not running".into()),
+    }
+
+    let roots = state_roots();
+    if !roots.is_empty() {
+        parts.push(format!("state dirs {}", roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")));
+    }
+
+    format!("Antigravity: {}", parts.join(" | "))
 }
 
 #[cfg(test)]

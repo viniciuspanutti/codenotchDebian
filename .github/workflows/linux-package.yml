@@ -1,0 +1,54 @@
+name: Linux Package
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    
+jobs:
+  package:
+    name: Debian and AppImage bundles
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install system dependencies (Debian/Ubuntu)
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libxdo-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+
+      - name: Build hook
+        run: cargo build --release -p codenotch-hook --target-dir target/hook
+
+      - name: Build bundles (.deb, .AppImage)
+        working-directory: windows/codenotch
+        run: |
+          npx --yes @tauri-apps/cli@2 build --config tauri.linux.bundle.conf.json
+
+      - name: Upload .deb artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: codenotch-deb-${{ github.sha }}
+          path: windows/target/release/bundle/deb/*.deb
+          if-no-files-found: warn
+
+      - name: Upload .AppImage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: codenotch-appimage-${{ github.sha }}
+          path: windows/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: warn

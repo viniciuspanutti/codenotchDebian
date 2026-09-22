@@ -1,0 +1,484 @@
+#!/usr/bin/env python3
+"""
+Codenotch Control CLI for Linux
+Provides manual control (start, stop, restart, status, toggle, pause, resume)
+and automatic mode management via systemd --user (auto-on, auto-off, auto-status).
+"""
+
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "codenotch"
+IDE_CONFIG_FILE = CONFIG_DIR / "ide_watch.json"
+STATE_FILE = CONFIG_DIR / "watch_state.json"
+PID_FILE = CONFIG_DIR / "codenotch.pid"
+SERVICE_NAME = "codenotch-ide-watch.service"
+USER_SYSTEMD_DIR = Path.home() / ".config" / "systemd" / "user"
+USER_SERVICE_FILE = USER_SYSTEMD_DIR / SERVICE_NAME
+LEGACY_AUTOSTART_FILE = Path.home() / ".config" / "autostart" / "codenotch.desktop"
+
+DEFAULT_IDE_CONFIG = {
+    "interval_seconds": 3,
+    "ides": [
+        {
+            "name": "Cursor",
+            "executables": ["/usr/share/cursor/cursor"],
+            "process_names": ["cursor"]
+        },
+        {
+            "name": "Antigravity",
+            "executables": ["/opt/antigravity/antigravity"],
+            "process_names": ["antigravity"]
+        },
+        {
+            "name": "VS Code",
+            "executables": ["/usr/share/code/code"],
+            "process_names": ["code"]
+        }
+    ]
+}
+
+def load_ide_config():
+    if not IDE_CONFIG_FILE.exists():
+        return DEFAULT_IDE_CONFIG
+    try:
+        with open(IDE_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return DEFAULT_IDE_CONFIG
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {"paused": False, "stopped_ides": []}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {"paused": False, "stopped_ides": []}
+
+def save_state(state):
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        print(f"Error saving state: {e}", file=sys.stderr)
+
+def find_codenotch_pid():
+    my_uid = os.getuid()
+    if PID_FILE.exists():
+        try:
+            pid = int(PID_FILE.read_text().strip())
+            exe = os.readlink(f"/proc/{pid}/exe")
+            if "codenotch" in os.path.basename(exe):
+                return pid
+        except Exception:
+            pass
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        try:
+            p_stat = os.stat(f"/proc/{pid}")
+            if p_stat.st_uid != my_uid:
+                continue
+            exe = os.readlink(f"/proc/{pid}/exe")
+            if os.path.basename(exe) == "codenotch":
+                PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+                PID_FILE.write_text(str(pid))
+                return pid
+        except Exception:
+            continue
+    return None
+
+def find_running_ides():
+    config = load_ide_config()
+    ides_config = config.get("ides", [])
+    my_uid = os.getuid()
+    running_ides = set()
+    my_pid = os.getpid()
+
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == my_pid:
+            continue
+        try:
+            p_stat = os.stat(f"/proc/{pid}")
+            if p_stat.st_uid != my_uid:
+                continue
+            exe = os.readlink(f"/proc/{pid}/exe")
+            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="ignore").strip()
+        except Exception:
+            continue
+
+        exe_base = os.path.basename(exe)
+        for ide in ides_config:
+            name = ide["name"]
+            configured_exes = ide.get("executables", [])
+            configured_names = ide.get("process_names", [])
+
+            if exe in configured_exes:
+                running_ides.add(name)
+            elif exe_base in configured_names or comm in configured_names:
+                running_ides.add(name)
+
+    return sorted(list(running_ides))
+
+def resolve_codenotch_binary():
+    env_bin = os.environ.get("CODENOTCH_BIN")
+    if env_bin and os.path.isfile(env_bin) and os.access(env_bin, os.X_OK):
+        return env_bin
+
+    custom_bin_file = CONFIG_DIR / "binary_path"
+    if custom_bin_file.exists():
+        custom_path = custom_bin_file.read_text().strip()
+        if os.path.isfile(custom_path) and os.access(custom_path, os.X_OK):
+            return custom_path
+
+    user_bin = Path.home() / ".local" / "bin" / "codenotch"
+    if user_bin.exists() and os.access(user_bin, os.X_OK):
+        return str(user_bin.resolve())
+
+    import shutil
+    path_bin = shutil.which("codenotch")
+    if path_bin:
+        return path_bin
+
+    known_paths = [
+        Path.home() / "Documents/pessoal/Projetos_Github/AppConsumoIA/codenotchDebian/windows/target/release/codenotch",
+        Path.home() / "Documents/pessoal/Projetos_Github/AppConsumoIA/codenotchDebian/windows/target/debug/codenotch",
+    ]
+    for p in known_paths:
+        if p.exists() and os.access(p, os.X_OK):
+            return str(p)
+
+    return None
+
+def clean_legacy_autostart():
+    if LEGACY_AUTOSTART_FILE.exists():
+        try:
+            LEGACY_AUTOSTART_FILE.unlink()
+            print(f"Removed legacy autostart entry: {LEGACY_AUTOSTART_FILE}")
+        except Exception as e:
+            print(f"Warning: could not remove legacy autostart file: {e}", file=sys.stderr)
+
+def cmd_start():
+    clean_legacy_autostart()
+    state = load_state()
+    state["paused"] = False
+    state["stopped_ides"] = []
+    save_state(state)
+
+    pid = find_codenotch_pid()
+    if pid:
+        print(f"Codenotch is already running (PID: {pid})")
+        return 0
+
+    bin_path = resolve_codenotch_binary()
+    if not bin_path:
+        print("Error: codenotch binary could not be found.", file=sys.stderr)
+        return 1
+
+    env = os.environ.copy()
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+    if "WAYLAND_DISPLAY" not in env and os.path.exists(f"/run/user/{os.getuid()}/wayland-0"):
+        env["WAYLAND_DISPLAY"] = "wayland-0"
+
+    try:
+        proc = subprocess.Popen(
+            [bin_path],
+            env=env,
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL
+        )
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(str(proc.pid))
+        print(f"Codenotch started (PID: {proc.pid})")
+        return 0
+    except Exception as e:
+        print(f"Failed to start Codenotch: {e}", file=sys.stderr)
+        return 1
+
+def cmd_stop(manual_stop=True):
+    clean_legacy_autostart()
+    if manual_stop:
+        running_ides = find_running_ides()
+        state = load_state()
+        state["stopped_ides"] = running_ides
+        save_state(state)
+
+    pid = find_codenotch_pid()
+    if not pid:
+        print("Codenotch is stopped")
+        return 0
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+        for _ in range(25):
+            time.sleep(0.1)
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                break
+        else:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    except ProcessLookupError:
+        pass
+    except Exception as e:
+        print(f"Error stopping Codenotch: {e}", file=sys.stderr)
+
+    if PID_FILE.exists():
+        try:
+            PID_FILE.unlink()
+        except Exception:
+            pass
+
+    print(f"Codenotch stopped (PID {pid} terminated)")
+    return 0
+
+def cmd_restart():
+    state = load_state()
+    state["stopped_ides"] = []
+    save_state(state)
+    cmd_stop(manual_stop=False)
+    time.sleep(0.5)
+    return cmd_start()
+
+def cmd_status():
+    pid = find_codenotch_pid()
+    if pid:
+        print(f"Codenotch: RUNNING (PID: {pid})")
+    else:
+        print("Codenotch: STOPPED")
+
+    # Check auto service status
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "is-active", SERVICE_NAME],
+            capture_output=True, text=True
+        )
+        is_active = res.stdout.strip()
+    except Exception:
+        is_active = "unknown"
+
+    try:
+        res_en = subprocess.run(
+            ["systemctl", "--user", "is-enabled", SERVICE_NAME],
+            capture_output=True, text=True
+        )
+        is_enabled = res_en.stdout.strip()
+    except Exception:
+        is_enabled = "unknown"
+
+    state = load_state()
+    paused = state.get("paused", False)
+    stopped_ides = state.get("stopped_ides", [])
+
+    running_ides = find_running_ides()
+    print(f"IDE Auto-Watch Service: {is_active.upper()} (enabled: {is_enabled})")
+    if paused:
+        print("Auto-Watch State: PAUSED (manual pause active)")
+    elif stopped_ides:
+        active_suppressed = [i for i in stopped_ides if i in running_ides]
+        if active_suppressed:
+            print(f"Auto-Watch State: SUPPRESSED for current session of: {', '.join(active_suppressed)}")
+        else:
+            print("Auto-Watch State: ACTIVE (idle)")
+    else:
+        print("Auto-Watch State: ACTIVE")
+
+    if running_ides:
+        print(f"Detected Open IDEs: {', '.join(running_ides)}")
+    else:
+        print("Detected Open IDEs: None")
+
+    return 0
+
+def cmd_toggle():
+    pid = find_codenotch_pid()
+    if pid:
+        return cmd_stop(manual_stop=True)
+    else:
+        return cmd_start()
+
+def cmd_pause():
+    state = load_state()
+    state["paused"] = True
+    save_state(state)
+    cmd_stop(manual_stop=False)
+    print("Automatic IDE monitoring paused. Codenotch will not start automatically until resumed.")
+    return 0
+
+def cmd_resume():
+    state = load_state()
+    state["paused"] = False
+    state["stopped_ides"] = []
+    save_state(state)
+    print("Automatic IDE monitoring resumed.")
+    running_ides = find_running_ides()
+    if running_ides and not find_codenotch_pid():
+        print(f"IDEs open ({', '.join(running_ides)}), starting Codenotch...")
+        return cmd_start()
+    return 0
+
+def ensure_installed():
+    USER_SYSTEMD_DIR.mkdir(parents=True, exist_ok=True)
+    script_dir = Path(__file__).resolve().parent
+    repo_root = script_dir.parent.parent
+    service_src = repo_root / "linux" / "systemd" / SERVICE_NAME
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+
+    # Copy / update systemd service unit
+    if service_src.exists():
+        service_content = service_src.read_text()
+        USER_SERVICE_FILE.write_text(service_content)
+
+    # Symlink binaries to ~/.local/bin
+    control_target = local_bin / "codenotch-control"
+    if not control_target.exists() or control_target.is_symlink():
+        try:
+            control_target.unlink(missing_ok=True)
+            control_target.symlink_to(script_dir / "codenotch-control")
+        except Exception:
+            pass
+
+    watch_target = local_bin / "codenotch-ide-watch"
+    if not watch_target.exists() or watch_target.is_symlink():
+        try:
+            watch_target.unlink(missing_ok=True)
+            watch_target.symlink_to(script_dir / "codenotch-ide-watch")
+        except Exception:
+            pass
+
+    bin_path = resolve_codenotch_binary()
+    if bin_path:
+        cn_target = local_bin / "codenotch"
+        if not cn_target.exists() or cn_target.is_symlink():
+            try:
+                cn_target.unlink(missing_ok=True)
+                cn_target.symlink_to(bin_path)
+            except Exception:
+                pass
+
+    clean_legacy_autostart()
+
+def cmd_auto_on():
+    ensure_installed()
+    state = load_state()
+    state["paused"] = False
+    state["stopped_ides"] = []
+    save_state(state)
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "--now", SERVICE_NAME], check=True)
+    print("Automatic IDE monitoring enabled and started (codenotch-ide-watch.service).")
+    return 0
+
+def cmd_auto_off():
+    try:
+        subprocess.run(["systemctl", "--user", "stop", SERVICE_NAME], check=False)
+        subprocess.run(["systemctl", "--user", "disable", SERVICE_NAME], check=False)
+        print("Automatic IDE monitoring disabled (codenotch-ide-watch.service stopped and disabled).")
+    except Exception as e:
+        print(f"Error disabling service: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+def cmd_auto_status():
+    print(f"=== Systemd User Status for {SERVICE_NAME} ===")
+    res = subprocess.run(["systemctl", "--user", "status", SERVICE_NAME], capture_output=False)
+    return res.returncode
+
+def cmd_uninstall():
+    cmd_auto_off()
+    if USER_SERVICE_FILE.exists():
+        USER_SERVICE_FILE.unlink()
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
+    local_bin = Path.home() / ".local" / "bin"
+    for name in ["codenotch-control", "codenotch-ide-watch", "codenotch"]:
+        p = local_bin / name
+        if p.is_symlink():
+            p.unlink()
+    clean_legacy_autostart()
+    print("Codenotch automation and user systemd service completely uninstalled.")
+    return 0
+
+def print_help():
+    print("""Usage: codenotch-control <command>
+
+Manual Execution Commands:
+  start        Start Codenotch (if not already running)
+  stop         Stop Codenotch cleanly (does not terminate IDEs; pauses watcher for current IDE session)
+  restart      Restart Codenotch
+  status       Show Codenotch and automation running status, PID, and open IDEs
+  toggle       Toggle running state (stops if running, starts if stopped)
+  pause        Explicitly pause IDE monitoring until resume/start
+  resume       Resume IDE monitoring
+
+Automatic Mode Commands:
+  auto-on      Enable and start systemd user service (codenotch-ide-watch.service)
+  auto-off     Stop and disable systemd user service
+  auto-status  Show full systemd user service status
+
+Management:
+  setup        Install/link ~/.local/bin and ~/.config/systemd/user files
+  uninstall    Completely remove systemd user service and ~/.local/bin links
+""")
+
+def main():
+    if len(sys.argv) < 2:
+        print_help()
+        sys.exit(1)
+
+    cmd = sys.argv[1].lower()
+    if cmd == "start":
+        sys.exit(cmd_start())
+    elif cmd == "stop":
+        sys.exit(cmd_stop(manual_stop=True))
+    elif cmd == "restart":
+        sys.exit(cmd_restart())
+    elif cmd == "status":
+        sys.exit(cmd_status())
+    elif cmd == "toggle":
+        sys.exit(cmd_toggle())
+    elif cmd == "pause":
+        sys.exit(cmd_pause())
+    elif cmd == "resume":
+        sys.exit(cmd_resume())
+    elif cmd == "auto-on":
+        sys.exit(cmd_auto_on())
+    elif cmd == "auto-off":
+        sys.exit(cmd_auto_off())
+    elif cmd == "auto-status":
+        sys.exit(cmd_auto_status())
+    elif cmd in ("setup", "install-user"):
+        ensure_installed()
+        print("Setup completed successfully.")
+        sys.exit(0)
+    elif cmd in ("uninstall", "uninstall-user"):
+        sys.exit(cmd_uninstall())
+    elif cmd in ("-h", "--help", "help"):
+        print_help()
+        sys.exit(0)
+    else:
+        print(f"Unknown command: {cmd}\n", file=sys.stderr)
+        print_help()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

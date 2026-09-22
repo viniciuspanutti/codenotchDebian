@@ -59,6 +59,176 @@ The installer is not code-signed, so the first time it runs SmartScreen says *Wi
 your PC*. Choose **More info**, then **Run anyway**. Every Windows change also leaves an
 installer on its [Windows Package run](../../actions/workflows/windows-package.yml).
 
+## Linux
+
+Linux support is currently available through the community Linux port.
+Codenotch can run on Linux using the existing Rust + Tauri implementation, with Debian 13 (Trixie) as the primary tested distribution.
+
+### Tested environment
+
+- Debian GNU/Linux 13 (Trixie)
+- GNOME
+- Wayland through XWayland for precise notch positioning
+- X11
+- amd64 / x86_64
+- WebKitGTK 4.1
+
+### Features
+
+The Linux port currently supports:
+
+- Codex usage limits and sessions
+- Antigravity / Gemini quota monitoring
+- Settings and provider management
+- System tray integration
+- Desktop notifications
+- XDG configuration paths
+- Linux process/session discovery through `/proc`
+- Automatic start/stop based on supported IDEs
+- Manual execution control
+- `.deb` packaging
+- `AppImage` packaging
+
+### Installation
+
+#### Debian / Ubuntu (`.deb`)
+
+Download the latest Linux `.deb` package from the project's [Releases](../../releases/latest) page, then install it with:
+
+```sh
+sudo apt install ./Codenotch_<version>_amd64.deb
+```
+
+For example:
+
+```sh
+sudo apt install ./Codenotch_1.16.0_amd64.deb
+```
+
+Once installed, Codenotch can be launched from the application menu or from any terminal:
+
+```sh
+codenotch
+```
+
+If IDE-based automatic execution has been configured, it can be controlled from any directory with:
+
+```sh
+codenotch-control auto-on
+codenotch-control auto-off
+codenotch-control status
+```
+
+#### AppImage
+
+Alternatively, download the AppImage, make it executable and run it directly:
+
+```sh
+chmod +x Codenotch_*.AppImage
+./Codenotch_*.AppImage
+```
+
+### Debian development dependencies
+
+For building Codenotch from source on Debian:
+
+```sh
+sudo apt update
+sudo apt install -y \
+  libwebkit2gtk-4.1-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  libssl-dev \
+  libxdo-dev
+```
+
+### Build from source
+
+Clone the repository and run:
+
+```sh
+make linux-build
+```
+
+To run Codenotch:
+
+```sh
+make linux-run
+```
+
+Run the Linux test suite:
+
+```sh
+make linux-test
+make linux-check
+```
+
+Run Linux diagnostics:
+
+```sh
+make linux-doctor
+```
+
+### Packaging
+
+Generate Debian and AppImage packages with:
+
+```sh
+make linux-package
+```
+
+Generated packages are placed under:
+
+- `windows/target/release/bundle/deb/`
+- `windows/target/release/bundle/appimage/`
+
+### Execution management
+
+After setup, Codenotch can be controlled from any directory:
+
+```sh
+codenotch-control start
+codenotch-control stop
+codenotch-control restart
+codenotch-control status
+codenotch-control toggle
+```
+
+Automatic IDE-based execution can be enabled with:
+
+```sh
+codenotch-control auto-on
+```
+
+When enabled:
+- Opening a supported IDE starts Codenotch;
+- Opening additional IDEs does not create additional instances;
+- Closing the last supported IDE stops Codenotch.
+
+Disable automatic execution completely with:
+
+```sh
+codenotch-control auto-off
+```
+
+Additional controls:
+
+```sh
+codenotch-control pause
+codenotch-control resume
+codenotch-control auto-status
+```
+
+The automatic watcher runs as a per-user systemd service and does not require root privileges.
+
+### Known Linux limitations
+
+GNOME Wayland does not provide the same unrestricted absolute window positioning available under X11. On GNOME Wayland, Codenotch currently uses XWayland where necessary for precise edge positioning.
+
+Some desktop environments may also require AppIndicator support for the system tray icon.
+
+See [`linux/README.md`](linux/README.md) for development details and troubleshooting.
+
 ## Connect your phone
 
 The Codenotch phone app (iOS and Android) can show the same usage

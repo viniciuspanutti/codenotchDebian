@@ -4,6 +4,7 @@
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::time::Duration;
 
 const DEFAULT_PORT: u16 = 48666;
@@ -33,11 +34,11 @@ fn main() {
     // Give up quietly — never affect Claude Code
 }
 
-/// Pulls "port": N out of %APPDATA%\codenotch\config.json (hand-rolled scan, no dependency)
+/// Pulls "port": N out of config.json (hand-rolled scan, zero dependencies)
 fn read_port() -> u16 {
-    let path = match std::env::var("APPDATA") {
-        Ok(a) => format!("{a}\\codenotch\\config.json"),
-        Err(_) => return DEFAULT_PORT,
+    let config_path = get_config_path();
+    let Some(path) = config_path else {
+        return DEFAULT_PORT;
     };
     let Ok(txt) = std::fs::read_to_string(path) else {
         return DEFAULT_PORT;
@@ -53,6 +54,32 @@ fn read_port() -> u16 {
         }
     }
     DEFAULT_PORT
+}
+
+fn get_config_path() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var("APPDATA")
+            .ok()
+            .map(|a| PathBuf::from(format!("{a}\\codenotch\\config.json")))
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            let p = PathBuf::from(xdg).join("codenotch").join("config.json");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(home)
+                .join(".config")
+                .join("codenotch")
+                .join("config.json");
+            return Some(p);
+        }
+        None
+    }
 }
 
 fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
@@ -75,16 +102,15 @@ fn send(port: u16, event: &str, ppid: u32, body: &str) -> std::io::Result<()> {
 
 /// Launches the main app detached: no inherited handles, no window, never waits
 fn spawn_main() {
-    let Ok(me) = std::env::current_exe() else { return };
-    let Some(dir) = me.parent() else { return };
-    let exe = dir.join("codenotch.exe");
-    if !exe.exists() {
+    let exe = find_main_executable();
+    let Some(exe_path) = exe else {
         return;
-    }
-    let mut cmd = std::process::Command::new(exe);
+    };
+    let mut cmd = std::process::Command::new(exe_path);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -95,7 +121,39 @@ fn spawn_main() {
     let _ = cmd.spawn();
 }
 
-/// Parent process PID (≈ the Claude Code CLI process) via NtQueryInformationProcess, no dependency
+fn find_main_executable() -> Option<PathBuf> {
+    let binary_name = if cfg!(windows) { "codenotch.exe" } else { "codenotch" };
+
+    if let Ok(me) = std::env::current_exe() {
+        if let Some(dir) = me.parent() {
+            let exe = dir.join(binary_name);
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        for p in &["/usr/local/bin/codenotch", "/usr/bin/codenotch"] {
+            let pb = PathBuf::from(p);
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            let pb = PathBuf::from(home).join(".local").join("bin").join("codenotch");
+            if pb.is_file() {
+                return Some(pb);
+            }
+        }
+    }
+
+    None
+}
+
+/// Parent process PID (≈ the Claude Code CLI process) via NtQueryInformationProcess on Windows,
+/// or parent_id() on Unix
 #[cfg(windows)]
 fn parent_pid() -> u32 {
     #[repr(C)]
@@ -119,7 +177,6 @@ fn parent_pid() -> u32 {
     unsafe {
         let mut pbi = std::mem::zeroed::<Pbi>();
         let mut ret = 0u32;
-        // -1 = GetCurrentProcess()
         if NtQueryInformationProcess(
             -1,
             0,
@@ -137,4 +194,27 @@ fn parent_pid() -> u32 {
 #[cfg(not(windows))]
 fn parent_pid() -> u32 {
     std::os::unix::process::parent_id()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parent_pid_nonzero() {
+        let ppid = parent_pid();
+        assert!(ppid > 0, "parent_pid should be non-zero");
+    }
+
+    #[test]
+    fn test_read_port_fallback() {
+        // Without config or when missing, returns DEFAULT_PORT
+        let port = read_port();
+        assert!(port > 0);
+    }
+
+    #[test]
+    fn test_find_main_executable_does_not_panic() {
+        let _ = find_main_executable();
+    }
 }

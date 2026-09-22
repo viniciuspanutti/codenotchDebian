@@ -346,3 +346,38 @@ dmg-ci: build-ci
 	done
 	rm -rf $(CI_DIR)/stage
 	@echo "Unsigned disk image: $(CI_DMG)"
+
+# --- Linux targets -----------------------------------------------------------
+.PHONY: linux-build linux-run linux-test linux-doctor linux-hook linux-package linux-check
+
+CARGO ?= $(shell which cargo 2>/dev/null || echo $(HOME)/.cargo/bin/cargo)
+
+linux-check:
+	cd windows && node scripts/check-ui-scripts.mjs
+	cd windows && node scripts/test-claude-auth-ui.cjs
+	cd windows && node --test scripts/test-ko-i18n.cjs
+	cd windows && node --test test-codex-headline.cjs
+	cd windows && $(CARGO) check -p codenotch
+
+linux-hook:
+	cd windows && $(CARGO) build --release -p codenotch-hook --target-dir target/hook
+
+linux-build: linux-hook
+	cd windows && $(CARGO) build -p codenotch
+
+linux-test:
+	cd windows && node scripts/check-ui-scripts.mjs
+	cd windows && node scripts/test-claude-auth-ui.cjs
+	cd windows && node --test scripts/test-ko-i18n.cjs
+	cd windows && node --test test-codex-headline.cjs
+	cd windows && $(CARGO) test -p codenotch-hook
+	cd windows && $(CARGO) test -p codenotch
+
+linux-run:
+	cd windows && $(CARGO) run -p codenotch
+
+linux-doctor:
+	cd windows && $(CARGO) run -p codenotch -- doctor
+
+linux-package: linux-hook
+	cd windows/codenotch && PATH="$(HOME)/.cargo/bin:$$PATH" npx --yes @tauri-apps/cli@2 build --config tauri.linux.bundle.conf.json

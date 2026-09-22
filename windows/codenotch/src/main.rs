@@ -27,6 +27,8 @@ mod dropzones;
 mod watcher;
 mod settings_window;
 mod updater;
+pub mod cli_discovery;
+pub mod platform;
 
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager};
@@ -319,10 +321,10 @@ pub fn place_notch(app: &AppHandle) {
         zoom_notch(&w, ms, size);
         // Position from the window's measured physical size — deriving it from the scale factor
         // pushed the window past the right edge at 125 % / 150 % (the ring's right side was clipped).
-        let (ww, wh) = w
-            .outer_size()
-            .map(|s| (s.width as i32, s.height as i32))
-            .unwrap_or((target.width as i32, target.height as i32));
+        let (ww, wh) = match w.outer_size() {
+            Ok(s) if s.width > 0 && s.height > 0 => (s.width as i32, s.height as i32),
+            _ => (target.width as i32, target.height as i32),
+        };
         let ratio = {
             let st = app.state::<AppState>();
             let c = st.cfg.lock().unwrap();
@@ -330,11 +332,15 @@ pub fn place_notch(app: &AppHandle) {
         };
         let (x, y) = edge_origin(&mon, &edge, ww, wh, ratio);
         let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+        #[cfg(target_os = "linux")]
+        crate::platform::position_window(&w, x, y, target.width, target.height);
         let mut placed = (x, y, ww, wh);
-        if w.outer_size().map(|s| s.width != target.width).unwrap_or(false) {
+        if w.outer_size().map(|s| s.width > 0 && s.width != target.width).unwrap_or(false) {
             let _ = w.set_size(target);
             let (x, y) = edge_origin(&mon, &edge, target.width as i32, target.height as i32, ratio);
             let _ = w.set_position(tauri::PhysicalPosition::new(x, y));
+            #[cfg(target_os = "linux")]
+            crate::platform::position_window(&w, x, y, target.width, target.height);
             placed = (x, y, target.width as i32, target.height as i32);
         }
         // The page mirrors itself for the edge it is on; it cannot know that on its own.
@@ -349,7 +355,11 @@ pub fn place_notch(app: &AppHandle) {
         // overwritten (#240) — place_notch runs after every drag as well as at startup, and a
         // truncating write wiped the rest of the session's diagnostic trail on every drag.
         applog(&format!(
-            "notch placed build={BUILD}: edge={edge} pos=({x},{y}) size=({ww}x{wh}) inner={:?} win_scale={scale} mon_scale={ms} notch_size={size} monitor={:?}=({},{} {}x{}) work={:?} card_insets_css={insets:?}",
+            "notch placed build={BUILD}: edge={edge} pos=({},{}) size=({}x{}) inner={:?} win_scale={scale} mon_scale={ms} notch_size={size} monitor={:?}=({},{} {}x{}) work={:?} card_insets_css={insets:?}",
+            placed.0,
+            placed.1,
+            placed.2,
+            placed.3,
             w.inner_size().map(|s| (s.width, s.height)).unwrap_or((0, 0)),
             mon.name,
             mon.x,
@@ -428,7 +438,11 @@ fn left_button_down() -> bool {
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
     unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
 }
-#[cfg(not(windows))]
+#[cfg(target_os = "linux")]
+fn left_button_down() -> bool {
+    crate::platform::left_button_down_linux()
+}
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn left_button_down() -> bool {
     false
 }
@@ -727,14 +741,7 @@ pub fn reload_glyphs(app: &AppHandle) {
 fn open_data_dir() {
     let dir = config::config_path().parent().map(|p| p.to_path_buf()).unwrap_or_default();
     let _ = std::fs::create_dir_all(glyphs::user_dir());
-    let mut cmd = std::process::Command::new("explorer");
-    cmd.arg(dir.as_os_str());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let _ = cmd.spawn();
+    crate::platform::open_folder(&dir);
 }
 
 #[tauri::command]
@@ -767,14 +774,7 @@ pub(crate) fn provider_page(provider: &str) -> Option<(&'static str, &'static st
 
 pub(crate) fn open_provider_page(provider: &str) {
     let Some((url, _)) = provider_page(provider) else { return };
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/C", "start", "", url]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000);
-    }
-    let _ = cmd.spawn();
+    crate::platform::open_url(url);
 }
 
 /// Hot rectangles in **physical pixels**, window-relative, as x,y,w,h: the pill, plus the card
@@ -791,7 +791,10 @@ static HOT: Mutex<Vec<[f64; 4]>> = Mutex::new(Vec::new());
 static EXPANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[tauri::command]
-fn set_hot(rects: Vec<[f64; 4]>, expanded: bool) {
+fn set_hot(w: tauri::WebviewWindow, rects: Vec<[f64; 4]>, expanded: bool) {
+    #[cfg(target_os = "linux")]
+    crate::platform::apply_input_shape(&w, &rects);
+
     *HOT.lock().unwrap() = rects;
     EXPANDED.store(expanded, std::sync::atomic::Ordering::Relaxed);
     if expanded {
@@ -804,10 +807,14 @@ fn set_hot(rects: Vec<[f64; 4]>, expanded: bool) {
 /// never get the bit. `WS_EX_LAYERED` is what makes the window answer as one surface, so the helper
 /// that sets both is the only route. Clearing it again is safe — the notch is not otherwise layered
 /// (its transparency is DWM composition), so the window returns to the styles it had.
+#[cfg(windows)]
 fn set_click_through(app: &AppHandle, on: bool) {
     let Some(w) = app.get_webview_window("notch") else { return };
     let _ = w.set_ignore_cursor_events(on);
 }
+#[cfg(not(windows))]
+#[allow(dead_code)]
+fn set_click_through(_app: &AppHandle, _on: bool) {}
 
 /// The WebView zoom currently applied (1.0 = uncorrected)
 static ZOOM: Mutex<f64> = Mutex::new(1.0);
@@ -901,10 +908,12 @@ fn report_dpr(app: AppHandle, dpr: f64, w: f64, h: f64, settled: Option<bool>) {
 /// Slack around every hot rectangle: this is sampled on a timer, so a cursor arriving at the pill
 /// has to count as arrived slightly early, or a quick click lands between two polls while the
 /// window is still click-through and goes to whatever is behind it.
+#[allow(dead_code)]
 const HOT_PAD: f64 = 10.0;
 
 /// Is the cursor on something the window is there for? `window` is the outer size in physical
 /// pixels, or None when it could not be read.
+#[allow(dead_code)]
 fn cursor_in_hot(rects: &[[f64; 4]], lx: f64, ly: f64, window: Option<(f64, f64)>) -> bool {
     if rects.is_empty() {
         return false;
@@ -936,9 +945,11 @@ fn cursor_in_hot(rects: &[[f64; 4]], lx: f64, ly: f64, window: Option<(f64, f64)
 
 /// Was 150 ms, when this only decided whether the card stayed up. It now also gates whether a click
 /// reaches the notch, and at 150 ms a click arriving in the wrong sample went to the window behind.
+#[allow(dead_code)]
 const WATCHDOG_MS: u64 = 50;
 /// Kept at the original 300 ms rather than falling out of the faster poll, which would make the
 /// card twitchy.
+#[allow(dead_code)]
 const LEAVE_MS: u64 = 300;
 
 /// WebView2's mouseleave is unreliable inside a NOACTIVATE transparent window — a cursor that
@@ -952,6 +963,7 @@ const LEAVE_MS: u64 = 300;
 /// ordering is load-bearing: the window ignores the cursor while it is click-through, so the page
 /// gets no mousemove out there and cannot see the pointer arriving. This loop does, and hands the
 /// window its input back in time for the page to open the card.
+#[cfg(windows)]
 fn start_pointer_watchdog(app: AppHandle) {
     std::thread::spawn(move || {
         let need = (LEAVE_MS / WATCHDOG_MS).max(1) as u8;
@@ -1006,6 +1018,8 @@ fn start_pointer_watchdog(app: AppHandle) {
         }
     });
 }
+#[cfg(not(windows))]
+fn start_pointer_watchdog(_app: AppHandle) {}
 
 /// Log channel for the page: JS writes key diagnostics into run.log (if invoke itself fails, the page reports on screen instead)
 #[tauri::command]
@@ -1021,7 +1035,7 @@ fn focus_session(app: AppHandle, id: String) -> bool {
         store.ppid_of(&id)
     };
     match ppid {
-        Some(p) => focus::focus_terminal(p),
+        Some(p) => crate::platform::focus_terminal_window(p),
         None => focus::focus_claude_desktop(),
     }
 }
@@ -1628,10 +1642,104 @@ fn report(r: Result<String, String>) {
     let _ = std::fs::write(log, &msg);
 }
 
+fn is_demo_mode(args: &[String]) -> bool {
+    std::env::var("CODENOTCH_DEMO")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+        || args.iter().any(|a| a == "--demo")
+}
+
+fn demo_snapshot(provider: &str) -> usage::UsageSnapshot {
+    let now = now_ms();
+    match provider {
+        "claude" => usage::UsageSnapshot {
+            status: "ok".into(),
+            fetched_at: now,
+            windows: vec![
+                usage::LimitWindow {
+                    id: "session".into(),
+                    label: "Current session".into(),
+                    used: 0.73,
+                    resets_at: Some(now + 51 * 60 * 1000),
+                    ..Default::default()
+                },
+                usage::LimitWindow {
+                    id: "weekly_all".into(),
+                    label: "All models".into(),
+                    used: 0.07,
+                    resets_at: Some(now + 24 * 3600 * 1000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        "codex" => usage::UsageSnapshot {
+            status: "ok".into(),
+            fetched_at: now,
+            windows: vec![
+                usage::LimitWindow {
+                    id: "primary".into(),
+                    label: "5-hour Limit".into(),
+                    used: 0.21,
+                    resets_at: Some(now + 3 * 3600 * 1000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        "cursor" => usage::UsageSnapshot {
+            status: "ok".into(),
+            fetched_at: now,
+            windows: vec![
+                usage::LimitWindow {
+                    id: "included".into(),
+                    label: "Included usage".into(),
+                    used: 0.52,
+                    resets_at: Some(now + 12 * 3600 * 1000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        "grok" => usage::UsageSnapshot {
+            status: "ok".into(),
+            fetched_at: now,
+            windows: vec![
+                usage::LimitWindow {
+                    id: "weekly".into(),
+                    label: "Weekly limit".into(),
+                    used: 0.15,
+                    resets_at: Some(now + 48 * 3600 * 1000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        "antigravity" => usage::UsageSnapshot {
+            status: "ok".into(),
+            fetched_at: now,
+            windows: vec![
+                usage::LimitWindow {
+                    id: "gemini-5h".into(),
+                    label: "5-hour Limit".into(),
+                    used: 0.35,
+                    resets_at: Some(now + 2 * 3600 * 1000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        },
+        _ => usage::UsageSnapshot::default(),
+    }
+}
+
 /// The subcommands that print to the parent console; only those may attach to it.
 const CONSOLE_CMDS: [&str; 4] = ["install-hooks", "uninstall-hooks", "autostart", "doctor"];
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    crate::platform::init_environment();
+
     let args: Vec<String> = std::env::args().collect();
     if let Some(cmd) = args.get(1) {
         // Attaching on the GUI path too tied the notch to whatever cmd.exe launched it: closing that
@@ -1670,8 +1778,29 @@ fn main() {
         }
     }
 
+    let is_demo = is_demo_mode(&args);
     let cfg = config::load();
     let port = cfg.port;
+
+    let (usage_snap, codex_snap, cursor_snap, grok_snap, antigravity_snap, glm_snap) = if is_demo {
+        (
+            demo_snapshot("claude"),
+            demo_snapshot("codex"),
+            demo_snapshot("cursor"),
+            demo_snapshot("grok"),
+            demo_snapshot("antigravity"),
+            demo_snapshot("glm"),
+        )
+    } else {
+        (
+            usage::load_persisted(),
+            codex::load_persisted(),
+            cursor::load_persisted(),
+            grok::load_persisted(),
+            antigravity::load_persisted(),
+            glm::load_persisted(),
+        )
+    };
 
     tauri::Builder::default()
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1684,12 +1813,12 @@ fn main() {
         .manage(AppState {
             store: Mutex::new(Default::default()),
             cfg: Mutex::new(cfg),
-            usage: Mutex::new(usage::load_persisted()),
-            codex: Mutex::new(codex::load_persisted()),
-            cursor: Mutex::new(cursor::load_persisted()),
-            grok: Mutex::new(grok::load_persisted()),
-            antigravity: Mutex::new(antigravity::load_persisted()),
-            glm: Mutex::new(glm::load_persisted()),
+            usage: Mutex::new(usage_snap),
+            codex: Mutex::new(codex_snap),
+            cursor: Mutex::new(cursor_snap),
+            grok: Mutex::new(grok_snap),
+            antigravity: Mutex::new(antigravity_snap),
+            glm: Mutex::new(glm_snap),
             glyphs: Mutex::new(Default::default()),
             activity: Mutex::new(Vec::new()),
         })
@@ -1754,6 +1883,10 @@ fn main() {
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
+            #[cfg(target_os = "linux")]
+            if let Some(w) = handle.get_webview_window("notch") {
+                crate::platform::configure_notch_window(&w);
+            }
             place_notch(&handle);
             if let Some(w) = handle.get_webview_window("notch") {
                 let _ = w.show();
@@ -1766,13 +1899,17 @@ fn main() {
             apply_visibility(&handle);
             server::start(handle.clone(), port);
             watcher::start(handle.clone());
-            usage::start(handle.clone());
-            codex::start(handle.clone());
-            cursor::start(handle.clone());
-            grok::start(handle.clone());
-            antigravity::start(handle.clone());
-            glm::start(handle.clone());
-            activity::start(handle.clone());
+            if is_demo {
+                applog("running in DEMO mode (CODENOTCH_DEMO=1) — live provider polling skipped");
+            } else {
+                usage::start(handle.clone());
+                codex::start(handle.clone());
+                cursor::start(handle.clone());
+                grok::start(handle.clone());
+                antigravity::start(handle.clone());
+                glm::start(handle.clone());
+                activity::start(handle.clone());
+            }
             // Collecting glyphs may read icon resources out of a few executables; do it off the main thread and push when done
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));

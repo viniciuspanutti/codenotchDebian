@@ -62,16 +62,54 @@ pub fn is_installed() -> bool {
         .unwrap_or(false)
 }
 
+fn find_hook_executable() -> Option<PathBuf> {
+    let binary_name = if cfg!(windows) {
+        "codenotch-hook.exe"
+    } else {
+        "codenotch-hook"
+    };
+
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            let candidate = parent.join(binary_name);
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // In release / bundle layouts or cargo target layouts
+            for rel in &["../target/release", "../target/debug", "../target/hook/release"] {
+                let dev_cand = parent.join(rel).join(binary_name);
+                if dev_cand.exists() {
+                    return Some(dev_cand);
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        for prefix in &["/usr/local/bin", "/usr/bin"] {
+            let p = PathBuf::from(prefix).join(binary_name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        if let Some(h) = dirs::home_dir() {
+            let p = h.join(".local").join("bin").join(binary_name);
+            if p.exists() {
+                return Some(p);
+            }
+        }
+    }
+
+    None
+}
+
 pub fn install() -> Result<String, String> {
     let path = settings_path().ok_or("cannot find the user directory")?;
-    let hook_exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or("cannot locate the program directory")?
-        .join("codenotch-hook.exe");
-    if !hook_exe.exists() {
-        return Err(format!("missing {}", hook_exe.display()));
-    }
+    let hook_exe = find_hook_executable().ok_or_else(|| {
+        let name = if cfg!(windows) { "codenotch-hook.exe" } else { "codenotch-hook" };
+        format!("missing {name} beside application")
+    })?;
 
     let mut root = load(&path);
     if !root.is_object() {

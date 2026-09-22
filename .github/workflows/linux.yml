@@ -1,0 +1,66 @@
+name: Linux
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'windows/**'
+      - 'Makefile'
+      - '.github/workflows/linux.yml'
+  pull_request:
+    paths:
+      - 'windows/**'
+      - 'Makefile'
+      - '.github/workflows/linux.yml'
+
+jobs:
+  build:
+    name: Build and test (Linux)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: windows
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check the UI pages parse
+        run: node scripts/check-ui-scripts.mjs
+
+      - name: Test Claude sign-in controls
+        run: node scripts/test-claude-auth-ui.cjs
+
+      - name: Test Korean card localization
+        run: node --test scripts/test-ko-i18n.cjs
+
+      - name: Test Codex headline selection
+        run: node --test test-codex-headline.cjs
+
+      - name: Install system dependencies (Debian/Ubuntu)
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libxdo-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: windows
+
+      - name: Build hook
+        run: cargo build --release -p codenotch-hook --target-dir target/hook
+
+      - name: Build
+        run: cargo build
+
+      - name: Test
+        run: cargo test
+
+      - name: Clippy
+        run: cargo clippy --all-targets

@@ -1,7 +1,7 @@
 //! User-initiated sign-in through the standalone Claude Code CLI. OAuth stays in
 //! the CLI: no codes, tokens, browser URLs or credential writes cross widget IPC.
 use serde::Serialize;
-use std::{process::{Child, Command, Stdio}, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::{Duration, Instant}};
+use std::{process::{Child, Command}, sync::{atomic::{AtomicBool, Ordering}, Mutex}, time::{Duration, Instant}};
 
 static BUSY: AtomicBool = AtomicBool::new(false);
 static MESSAGE: Mutex<String> = Mutex::new(String::new());
@@ -35,26 +35,54 @@ pub fn usage_succeeded() {
 }
 
 // No interpolated shell input: even paths containing apostrophes arrive in env.
+fn sanitize_claude_env(cmd: &mut Command) {
+    for (key, _) in std::env::vars_os() {
+        let k = key.to_string_lossy();
+        if k == "CLAUDECODE"
+            || k.starts_with("CLAUDE_CODE_")
+            || matches!(k.as_ref(), "CLAUDE_CONFIG_DIR" | "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN")
+        {
+            cmd.env_remove(&key);
+        }
+    }
+}
+
+#[cfg(windows)]
 const LOGIN_SCRIPT: &str = "$Host.UI.RawUI.WindowTitle = 'Codenotch - Claude sign-in'; Write-Host 'Complete sign-in in your browser. Paste any code in this window.'; & $env:CODENOTCH_CLAUDE_CLI auth login --claudeai; $loginResult = $LASTEXITCODE; if ($loginResult -eq 0) { Write-Host 'Sign-in complete. Codenotch will refresh automatically.'; Start-Sleep -Seconds 2 } else { Write-Host 'Sign-in failed or cancelled. Retry from Codenotch.'; Start-Sleep -Seconds 8 }; exit $loginResult";
 
+#[cfg(windows)]
 fn login_command(cli: &std::path::Path) -> Result<Command, String> {
     let root = std::env::var_os("SystemRoot").ok_or("Windows directory unavailable.")?;
     let mut cmd = Command::new(std::path::PathBuf::from(root).join("System32/WindowsPowerShell/v1.0/powershell.exe"));
     cmd.args(["-NoLogo", "-NoProfile", "-Command", LOGIN_SCRIPT]).env("CODENOTCH_CLAUDE_CLI", cli);
     cmd.current_dir(dirs::home_dir().ok_or("Home directory unavailable.")?);
-    // A widget launched inside a Claude session must not inherit that session's
-    // auth or take the headless refresh-token login branch instead of the browser.
-    for (key, _) in std::env::vars_os() {
-        let k = key.to_string_lossy();
-        if k == "CLAUDECODE" || k.starts_with("CLAUDE_CODE_")
-            || matches!(k.as_ref(), "CLAUDE_CONFIG_DIR" | "ANTHROPIC_API_KEY" | "ANTHROPIC_AUTH_TOKEN") {
-            cmd.env_remove(&key);
+    sanitize_claude_env(&mut cmd);
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(0x0000_0010); // visible console only after a user's click
+    Ok(cmd)
+}
+
+#[cfg(not(windows))]
+fn login_command(cli: &std::path::Path) -> Result<Command, String> {
+    let home = dirs::home_dir().ok_or("Home directory unavailable.")?;
+    let terms = ["x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal", "xterm"];
+    for term in terms {
+        if let Some(term_path) = crate::cli_discovery::find_named_cli(term, &[term]) {
+            let mut cmd = Command::new(term_path);
+            if term == "gnome-terminal" {
+                cmd.args(["--", cli.to_str().unwrap_or("claude"), "auth", "login", "--claudeai"]);
+            } else {
+                cmd.args(["-e", &format!("{} auth login --claudeai", cli.display())]);
+            }
+            cmd.current_dir(&home);
+            sanitize_claude_env(&mut cmd);
+            return Ok(cmd);
         }
     }
-    #[cfg(windows)] {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0000_0010); // visible console only after a user's click
-    }
+    let mut cmd = Command::new(cli);
+    cmd.args(["auth", "login", "--claudeai"]);
+    cmd.current_dir(&home);
+    sanitize_claude_env(&mut cmd);
     Ok(cmd)
 }
 

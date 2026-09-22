@@ -257,28 +257,8 @@ fn is_desktop_owned(p: &std::path::Path) -> bool {
     s.contains("\\anthropicclaude\\") || s.contains("\\claude\\claude-code\\") || s.contains("\\windowsapps\\")
 }
 
-/// The standalone Claude Code command: its own installer's location first, then global npm/pnpm/Volta, then PATH
 pub(crate) fn find_cli() -> Option<std::path::PathBuf> {
-    let mut v = Vec::new();
-    if let Some(h) = dirs::home_dir() {
-        v.push(h.join(".local").join("bin").join("claude.exe"));
-    }
-    if let Some(d) = dirs::config_dir() {
-        v.push(d.join("npm").join("claude.cmd"));
-    }
-    if let Some(d) = dirs::data_local_dir() {
-        v.push(d.join("pnpm").join("claude.cmd"));
-    }
-    if let Some(h) = dirs::home_dir() {
-        v.push(h.join(".volta").join("bin").join("claude.exe"));
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path) {
-            v.push(dir.join("claude.exe"));
-            v.push(dir.join("claude.cmd"));
-        }
-    }
-    v.into_iter().find(|p| p.is_file() && !is_desktop_owned(p))
+    crate::cli_discovery::find_claude_cli()
 }
 
 /// Whether a launch is worth making. Pure, so every branch is testable without a clock or a subprocess

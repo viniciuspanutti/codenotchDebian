@@ -1226,7 +1226,14 @@ function rectOf(el){const r=el.getBoundingClientRect(),k=window.devicePixelRatio
 function reportHot(){
   if(folded){ callq('set_hot',{rects:[wakeRect()],expanded:false}).catch(()=>{}); return; }
   const open=card.classList.contains('show');
-  const rects=open?[rectOf(pill),rectOf(tail),rectOf(card)]:[rectOf(pill)];
+  let rects;
+  if(open){
+    const p=pill.getBoundingClientRect(), c=card.getBoundingClientRect(), k=window.devicePixelRatio||1;
+    const u=[Math.min(p.left,c.left)*k, Math.min(p.top,c.top)*k, (Math.max(p.right,c.right)-Math.min(p.left,c.left))*k, (Math.max(p.bottom,c.bottom)-Math.min(p.top,c.top))*k];
+    rects=[u, rectOf(pill), rectOf(card)];
+  } else {
+    rects=[rectOf(pill)];
+  }
   if(placeHandles()){ rects.push(rectOf(orb)); if(showMove) rects.push(rectOf(moveHandle)); }
   callq('set_hot',{rects,expanded:open}).catch(()=>{});
 }
@@ -1312,8 +1319,21 @@ document.addEventListener('mousemove',e=>{
   }
   else if(card.classList.contains('show')){ if(hideLogged++<5) jslog(`mousemove left the hot area -> collapse at ${e.clientX},${e.clientY}`); scheduleHide(); }
 });
+document.addEventListener('mouseenter',()=>{
+  pointerIn=true;
+  if(folded) unfold();
+});
 document.addEventListener('mouseout',e=>{ // relatedTarget null = the cursor left the page
-  if(!e.relatedTarget && card.classList.contains('show')){ if(hideLogged++<5) jslog('mouseout left the page -> collapse'); scheduleHide(); }
+  if(!e.relatedTarget){
+    pointerIn=false;
+    scheduleFold();
+    if(card.classList.contains('show')){ if(hideLogged++<5) jslog('mouseout left the page -> collapse'); scheduleHide(); }
+  }
+});
+document.addEventListener('mouseleave',()=>{
+  pointerIn=false;
+  scheduleFold();
+  if(card.classList.contains('show')){ scheduleHide(); }
 });
 listen('pointer_left',()=>{clearTimeout(hideTimer);hideCard();}).catch(()=>{});
 // Card content changes change its height -> report the hot rectangles again

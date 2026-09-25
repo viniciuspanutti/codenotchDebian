@@ -69,6 +69,7 @@ def main():
 
         # Setup test configuration with dedicated test IDE names to avoid interfering with user session
         test_conf = {
+            "replace_defaults": True,
             "interval_seconds": 1,
             "ides": [
                 {

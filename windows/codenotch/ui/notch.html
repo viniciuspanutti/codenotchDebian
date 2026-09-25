@@ -223,7 +223,7 @@
   @media (prefers-reduced-motion: reduce){.handle > *{transition:none}}
 </style>
 </head>
-<body>
+<body class="folded">
 <div id="root">
   <div id="card"></div>
   <div id="tail"></div>
@@ -292,7 +292,7 @@ let activity=[]; // working state of the non-Claude providers: {provider,state:'
    told so it can mirror or rotate itself to match. 'right' is the default and the pre-edge layout. */
 let notchEdge='right';
 // Show on hover — the logic is beside the move handle below; declared here, since reportHot reads `folded` from the first frame
-let onHover=false, folded=false, pointerIn=false, menuOpen=false, foldTimer=null;
+let onHover=false, folded=true, pointerIn=false, menuOpen=false, foldTimer=null;
 /* How much of the window the taskbar covers, in CSS px, from Rust: top, right, bottom, left. The pill
    stays against the screen edge; the card is kept out of these. */
 let insets=[0,0,0,0];
@@ -1224,7 +1224,7 @@ function rectOf(el){const r=el.getBoundingClientRect(),k=window.devicePixelRatio
 /* Rust gates click-through on these, so they are reported whenever the pill or card moves, not only
    when the card opens: a stale pill rectangle is a pill that cannot be clicked. */
 function reportHot(){
-  if(folded){ callq('set_hot',{rects:[wakeRect()],expanded:false}).catch(()=>{}); return; }
+  if(folded){ callq('set_hot',{rects:[rectOf(document.getElementById('rest'))],expanded:false}).catch(()=>{}); return; }
   const open=card.classList.contains('show');
   let rects;
   if(open){
@@ -1235,18 +1235,7 @@ function reportHot(){
     rects=[rectOf(pill)];
   }
   if(placeHandles()){ rects.push(rectOf(orb)); if(showMove) rects.push(rectOf(moveHandle)); }
-  callq('set_hot',{rects,expanded:open}).catch(()=>{});
-}
-/* What wakes the folded notch: the resting pill, as long along the edge as the pill and deepened into
-   the screen by the Mac's pillHotZone — Design.px(90), 34 here — because the pill is small and the
-   place that opens it should not be (NotchViewModel.wakeLength and wakeDepth). */
-const WAKE_BAND=34;
-function wakeRect(){
-  const r=document.getElementById('rest').getBoundingClientRect(), k=window.devicePixelRatio||1;
-  const b=WAKE_BAND*(parseFloat(document.documentElement.style.zoom)||1); // rects come back zoomed
-  let x=r.left,y=r.top,w=r.width,h=r.height;
-  if(notchEdge==='left') w+=b; else if(notchEdge==='top') h+=b; else if(notchEdge==='bottom'){ y-=b; h+=b; } else { x-=b; w+=b; }
-  return [x*k,y*k,w*k,h*k];
+  callq('set_hot',{rects,expanded:true}).catch(()=>{});
 }
 function armWatchdog(){
   requestAnimationFrame(reportHot); // wait one frame so renderCard's new content is laid out before measuring
@@ -1335,7 +1324,7 @@ document.addEventListener('mouseleave',()=>{
   scheduleFold();
   if(card.classList.contains('show')){ scheduleHide(); }
 });
-listen('pointer_left',()=>{clearTimeout(hideTimer);hideCard();}).catch(()=>{});
+listen('pointer_left',()=>{pointerIn=false;scheduleHide();scheduleFold();}).catch(()=>{});
 // Card content changes change its height -> report the hot rectangles again
 listen('usage',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
 listen('state',()=>{if(card.classList.contains('show'))armWatchdog();}).catch(()=>{});
@@ -1412,7 +1401,8 @@ function notice(msg){
    A click on the settings orb opens Settings; holding the move handle carries the notch. */
 const orb=document.getElementById('orb'), moveHandle=document.getElementById('move');
 const HANDLE_REACH=28.5; // the Mac's hot zone, half of 57
-let orbAt=null, moveAt=null, hovered=null, orbSpins=0, moveSpins=0, showMove=true, carrying=false;
+const IS_LINUX=/Linux/i.test(navigator.userAgent);
+let orbAt=null, moveAt=null, hovered=null, orbSpins=0, moveSpins=0, showMove=true, carrying=false, carryPointer=null;
 function put(el,x,y,z){
   el.style.left=(x/z-HANDLE_REACH)+'px'; el.style.top=(y/z-HANDLE_REACH)+'px';
   el.classList.add('placed');
@@ -1471,7 +1461,7 @@ function pillShapes(){
   return { depth:70, length:ends+cells*(ring+underRing+label)+(cells-1)*between };
 }
 moveHandle.addEventListener('mousedown',e=>{
-  if(e.button!==0||!near(moveAt,e.clientX,e.clientY)) return;
+  if(IS_LINUX||e.button!==0||!near(moveAt,e.clientX,e.clientY)) return;
   e.stopPropagation();
   carrying=true;
   moveHandle.classList.add('armed','hover');
@@ -1479,6 +1469,36 @@ moveHandle.addEventListener('mousedown',e=>{
   clearTimeout(hideTimer); hideCard();
   callq('begin_move',pillShapes()).catch(()=>{carrying=false;moveHandle.classList.remove('armed');});
 });
+moveHandle.addEventListener('pointerdown',e=>{
+  if(!IS_LINUX||e.button!==0||!near(moveAt,e.clientX,e.clientY)) return;
+  e.preventDefault(); e.stopPropagation();
+  moveHandle.setPointerCapture(e.pointerId);
+  carryPointer={id:e.pointerId,x:e.clientX,y:e.clientY,moved:false};
+  carrying=true;
+  moveHandle.classList.add('armed','hover');
+  moveHandle.style.setProperty('--spins',++moveSpins);
+  clearTimeout(hideTimer); hideCard(); clearTimeout(foldTimer);
+  callq('linux_vertical_drag_begin',{pointerY:e.screenY}).then(ok=>{
+    if(!ok){ carrying=false; carryPointer=null; moveHandle.classList.remove('armed'); }
+  }).catch(()=>{carrying=false;carryPointer=null;moveHandle.classList.remove('armed');});
+});
+moveHandle.addEventListener('pointermove',e=>{
+  if(!IS_LINUX||!carrying||!carryPointer||e.pointerId!==carryPointer.id) return;
+  if(Math.hypot(e.clientX-carryPointer.x,e.clientY-carryPointer.y)>4) carryPointer.moved=true;
+  if(carryPointer.moved) callq('linux_vertical_drag_update',{pointerY:e.screenY}).catch(()=>{});
+});
+function finishLinuxCarry(e){
+  if(!IS_LINUX||!carryPointer||e.pointerId!==carryPointer.id) return;
+  const moved=carryPointer.moved;
+  pointerIn=!!onHandle(e.clientX,e.clientY)||pointerInHot(e.clientX,e.clientY);
+  if(moveHandle.hasPointerCapture(e.pointerId)) moveHandle.releasePointerCapture(e.pointerId);
+  carryPointer=null;
+  callq('linux_vertical_drag_end',{moved}).catch(()=>{
+    carrying=false; moveHandle.classList.remove('armed'); scheduleFold();
+  });
+}
+moveHandle.addEventListener('pointerup',finishLinuxCarry);
+moveHandle.addEventListener('pointercancel',finishLinuxCarry);
 listen('move_end',()=>{ carrying=false; moveHandle.classList.remove('armed'); setHovered(null); reportHot(); scheduleFold(); }).catch(()=>{});
 
 /* Show on hover, the Mac's .onHover. It opens on contact and folds a moment after the pointer has gone.
@@ -1500,8 +1520,9 @@ function scheduleFold(){
   if(!onHover){ setFolded(false); return; }
   if(foldAllowed()) foldTimer=setTimeout(()=>{ if(foldAllowed()) setFolded(true); },FOLD_GRACE);
 }
-function applyUiFlags(f){ onHover=!!(f&&f.notch_on_hover); scheduleFold(); }
+function applyUiFlags(f){ onHover=IS_LINUX||!!(f&&f.notch_on_hover); scheduleFold(); }
 listen('notch_pointer',e=>{ pointerIn=e.payload===true; if(pointerIn) unfold(); else scheduleFold(); }).catch(()=>{});
+listen('linux_host_visible',()=>{ pointerIn=false; setFolded(true); }).catch(()=>{});
 listen('ui_flags',e=>applyUiFlags(e.payload)).catch(()=>{});
 invoke('get_ui_flags').then(applyUiFlags).catch(()=>{});
 listen('move_handle',e=>{ showMove=e.payload!==false; reportHot(); }).catch(()=>{});

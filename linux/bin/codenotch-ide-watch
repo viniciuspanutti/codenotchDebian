@@ -13,31 +13,15 @@ import sys
 import time
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "codenotch"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "codenotch"
 IDE_CONFIG_FILE = CONFIG_DIR / "ide_watch.json"
 STATE_FILE = CONFIG_DIR / "watch_state.json"
 PID_FILE = CONFIG_DIR / "codenotch.pid"
 
-DEFAULT_IDE_CONFIG = {
-    "interval_seconds": 3,
-    "ides": [
-        {
-            "name": "Cursor",
-            "executables": ["/usr/share/cursor/cursor"],
-            "process_names": ["cursor"]
-        },
-        {
-            "name": "Antigravity",
-            "executables": ["/opt/antigravity/antigravity"],
-            "process_names": ["antigravity"]
-        },
-        {
-            "name": "VS Code",
-            "executables": ["/usr/share/code/code"],
-            "process_names": ["code"]
-        }
-    ]
-}
+# Resolve symlinks installed by setup before importing the shared catalogue.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from development_apps import DEFAULT_IDE_CONFIG, merge_config, find_running_ides as scan_ides, watcher_action
+
 
 running = True
 
@@ -63,7 +47,7 @@ def load_ide_config():
     try:
         with open(IDE_CONFIG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-            return data
+            return merge_config(data)
     except Exception as e:
         print(f"[codenotch-ide-watch] Warning: error reading {IDE_CONFIG_FILE}, using defaults: {e}", flush=True)
         return DEFAULT_IDE_CONFIG
@@ -91,7 +75,7 @@ def find_codenotch_pid():
         try:
             pid = int(PID_FILE.read_text().strip())
             exe = os.readlink(f"/proc/{pid}/exe")
-            if "codenotch" in os.path.basename(exe):
+            if os.path.basename(exe) == "codenotch" and os.stat(f"/proc/{pid}").st_uid == my_uid:
                 return pid
         except Exception:
             pass
@@ -115,37 +99,8 @@ def find_codenotch_pid():
     return None
 
 def find_running_ides(ide_configs):
-    my_uid = os.getuid()
-    running_ides = set()
-    my_pid = os.getpid()
+    return scan_ides(ide_configs)
 
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
-        pid = int(entry)
-        if pid == my_pid:
-            continue
-        try:
-            p_stat = os.stat(f"/proc/{pid}")
-            if p_stat.st_uid != my_uid:
-                continue
-            exe = os.readlink(f"/proc/{pid}/exe")
-            comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8", errors="ignore").strip()
-        except Exception:
-            continue
-
-        exe_base = os.path.basename(exe)
-        for ide in ide_configs:
-            name = ide["name"]
-            configured_exes = ide.get("executables", [])
-            configured_names = ide.get("process_names", [])
-
-            if exe in configured_exes:
-                running_ides.add(name)
-            elif exe_base in configured_names or comm in configured_names:
-                running_ides.add(name)
-
-    return sorted(list(running_ides))
 
 def resolve_codenotch_binary():
     # 1. Environment variable override
@@ -259,43 +214,17 @@ def main():
         ides_config = config.get("ides", [])
 
         state = load_state()
-        paused = state.get("paused", False)
-        stopped_ides = set(state.get("stopped_ides", []))
-
         running_ides = set(find_running_ides(ides_config))
-
-        # Check if all IDEs have closed
-        if not running_ides:
-            # If all IDEs closed, clear temporary stopped_ides suppression
-            if stopped_ides:
-                state["stopped_ides"] = []
-                save_state(state)
-                stopped_ides = set()
-
-            # Ensure Codenotch is closed when no IDEs are open
-            c_pid = find_codenotch_pid()
-            if c_pid:
-                print(f"[codenotch-ide-watch] No IDEs running. Closing Codenotch (PID: {c_pid}).", flush=True)
-                stop_codenotch()
-
-        else:
-            # At least one IDE is running
-            # Check if current running IDEs are still suppressed by manual stop
-            # If user opened a new IDE that wasn't in stopped_ides, we resume
-            active_unsuppressed = running_ides - stopped_ides
-
-            if paused:
-                # Explicit pause: do nothing
-                pass
-            elif not active_unsuppressed:
-                # All currently active IDEs were specifically stopped by user
-                pass
-            else:
-                # We have active, unsuppressed IDEs!
-                c_pid = find_codenotch_pid()
-                if not c_pid:
-                    print(f"[codenotch-ide-watch] Detected active IDEs: {sorted(list(running_ides))}. Starting Codenotch.", flush=True)
-                    start_codenotch()
+        if not running_ides and state.get("stopped_ides"):
+            state["stopped_ides"] = []
+            save_state(state)
+        action = watcher_action(running_ides, state, bool(find_codenotch_pid()))
+        if action == "stop":
+            print("[codenotch-ide-watch] No IDEs running. Closing Codenotch.", flush=True)
+            stop_codenotch()
+        elif action == "start":
+            print(f"[codenotch-ide-watch] IDEs open: {sorted(running_ides)}", flush=True)
+            start_codenotch()
 
         # Clean sleep
         slept = 0

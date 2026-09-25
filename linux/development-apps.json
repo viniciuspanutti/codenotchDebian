@@ -1,0 +1,11 @@
+[
+  {"id":"android-studio","name":"Android Studio","desktop_ids":["jetbrains-studio","com.google.AndroidStudio"],"executables":["/opt/android-studio/bin/studio"],"process_names":["studio"],"window_classes":["jetbrains-studio"],"java_selectors":["AndroidStudio"]},
+  {"id":"antigravity","name":"Antigravity","desktop_ids":["antigravity"],"executables":["/opt/antigravity/antigravity"],"process_names":["antigravity"],"window_classes":["antigravity"]},
+  {"id":"chatgpt","name":"ChatGPT","desktop_ids":["chatgpt","com.openai.ChatGPT","com.openai.codex"],"executables":["/usr/lib/chatgpt/ChatGPT"],"process_names":["ChatGPT"],"window_classes":["Chatgpt","com.openai.codex"]},
+  {"id":"intellij","name":"IntelliJ IDEA","desktop_ids":["intellij","jetbrains-idea","com.jetbrains.IntelliJ-IDEA-Ultimate","com.jetbrains.IntelliJ-IDEA-Community"],"executables":[],"process_names":["idea"],"window_classes":["jetbrains-idea","jetbrains-idea-ce"],"java_selectors":["IntelliJIdea","IdeaIC"]},
+  {"id":"pycharm","name":"PyCharm","desktop_ids":["pycharm","jetbrains-pycharm","com.jetbrains.PyCharm-Professional","com.jetbrains.PyCharm-Community"],"executables":["/opt/pycharm/bin/pycharm"],"process_names":["pycharm"],"window_classes":["jetbrains-pycharm","jetbrains-pycharm-ce"],"java_selectors":["PyCharm","PyCharmCE"]},
+  {"id":"clion","name":"CLion","desktop_ids":["clion","jetbrains-clion","com.jetbrains.CLion"],"executables":["/opt/clion/bin/clion"],"process_names":["clion"],"window_classes":["jetbrains-clion"],"java_selectors":["CLion"]},
+  {"id":"webstorm","name":"WebStorm","desktop_ids":["webstorm","jetbrains-webstorm","com.jetbrains.WebStorm"],"executables":["/opt/webstorm/bin/webstorm"],"process_names":["webstorm"],"window_classes":["jetbrains-webstorm"],"java_selectors":["WebStorm"]},
+  {"id":"vscode","name":"VS Code","desktop_ids":["code","com.visualstudio.code"],"executables":["/usr/share/code/code"],"process_names":["code"],"window_classes":["Code","code"]},
+  {"id":"cursor","name":"Cursor","desktop_ids":["cursor","com.todesktop.230313mzl4w4u92"],"executables":["/usr/share/cursor/cursor"],"process_names":["cursor"],"window_classes":["Cursor","cursor"]}
+]

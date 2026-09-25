@@ -33,6 +33,7 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 openssl = { version = "0.10", features = ["vendored"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+x11-dl = "2.21"
 gtk = "0.18"
 gdk = "0.18"
 cairo-rs = "0.18"

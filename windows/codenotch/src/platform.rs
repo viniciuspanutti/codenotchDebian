@@ -249,7 +249,7 @@ pub fn init_environment() {
 pub fn configure_notch_window(w: &tauri::WebviewWindow) {
     use gtk::prelude::*;
     let Ok(gtk_win) = w.gtk_window() else { return };
-    gtk_win.set_type_hint(gdk::WindowTypeHint::Dock);
+    gtk_win.set_type_hint(gdk::WindowTypeHint::Utility);
     gtk_win.set_keep_above(true);
     gtk_win.set_skip_taskbar_hint(true);
     gtk_win.set_skip_pager_hint(true);

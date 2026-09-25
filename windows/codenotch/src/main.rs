@@ -1,5 +1,9 @@
 #![cfg_attr(all(not(debug_assertions), windows), windows_subsystem = "windows")]
 
+#[cfg(target_os = "linux")]
+mod linux_window;
+#[cfg(target_os = "linux")]
+mod linux_x11;
 mod autostart;
 mod config;
 mod doctor;
@@ -171,6 +175,7 @@ fn target_screen(app: &AppHandle) -> Option<Screen> {
 /// covered by it. The Mac places against `frame` rather than `visibleFrame` on purpose, but what it
 /// overlaps there is the menu bar, which macOS lets a notch cover; the taskbar wins the z-order
 /// among topmost windows and is a click target of its own, so it is room lost.
+#[cfg(any(not(target_os = "linux"), test))]
 fn edge_origin(s: &Screen, edge: &str, ww: i32, wh: i32, ratio: f64) -> (i32, i32) {
     let (ax, ay, aw, ah) = s.area();
     let along = |span: i32, len: i32| -> i32 {
@@ -262,6 +267,7 @@ fn along_at(pos: i32, len: i32, start: i32, span: i32) -> f64 {
 /// (x, y, ww, wh), in physical pixels: top, right, bottom, left. `edge_origin` keeps the pill itself
 /// out of the taskbar, so what is left here is the window's other three sides — an upright notch is
 /// taller than the work area is on a short screen — and the hover card is what the page moves.
+#[cfg(any(not(target_os = "linux"), test))]
 fn work_insets(s: &Screen, x: i32, y: i32, ww: i32, wh: i32) -> [i32; 4] {
     let (wx, wy, waw, wah) = s.work;
     [
@@ -293,6 +299,14 @@ pub fn notch_window_size(edge: &str) -> (f64, f64) {
 }
 
 pub fn place_notch(app: &AppHandle) {
+    #[cfg(target_os = "linux")]
+    { linux_window::place(app); }
+    #[cfg(not(target_os = "linux"))]
+    place_monitor_notch(app);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn place_monitor_notch(app: &AppHandle) {
     let Some(w) = app.get_webview_window("notch") else {
         return;
     };
@@ -373,6 +387,7 @@ pub fn place_notch(app: &AppHandle) {
 
 /// How often the work area is re-read. It only changes by hand — the taskbar moved to another edge,
 /// resized, or switched to auto-hide — so a second late is not noticeable.
+#[cfg(not(target_os = "linux"))]
 const WORK_AREA_POLL_MS: u64 = 1000;
 
 /// Puts the notch back on its edge when the work area moves under it.
@@ -382,6 +397,7 @@ const WORK_AREA_POLL_MS: u64 = 1000;
 /// edge it is pinned to, floating in the gap the old taskbar left. Polled rather than hooked,
 /// because hooking it means subclassing a window we do not own to catch something that happens
 /// once in a session.
+#[cfg(not(target_os = "linux"))]
 fn start_work_area_watch(app: AppHandle) {
     std::thread::spawn(move || {
         let mut last = target_screen(&app).map(|s| s.work);
@@ -470,7 +486,10 @@ pub(crate) fn edge_at(x: f64, y: f64, w: f64, h: f64) -> &'static str {
 ///
 /// `depth` and `length` are the pill's own measurements standing upright, in the notch page's CSS px.
 #[tauri::command]
+#[allow(unreachable_code)]
 fn begin_move(app: AppHandle, depth: f64, length: f64) {
+    #[cfg(target_os = "linux")]
+    { let _ = (&app, depth, length); return; }
     if DRAGGING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -570,7 +589,38 @@ fn begin_move(app: AppHandle, depth: f64, length: f64) {
 }
 
 #[tauri::command]
+fn linux_vertical_drag_begin(app: AppHandle, pointer_y: f64) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if DRAGGING.swap(true, std::sync::atomic::Ordering::SeqCst) { return false; }
+        if linux_window::vertical_drag_begin(&app, pointer_y) { return true; }
+        DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    false
+}
+
+#[tauri::command]
+fn linux_vertical_drag_update(app: AppHandle, pointer_y: f64) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    { return linux_window::vertical_drag_update(&app, pointer_y); }
+    #[allow(unreachable_code)] None
+}
+
+#[tauri::command]
+fn linux_vertical_drag_end(app: AppHandle, moved: bool) -> Option<f64> {
+    #[cfg(target_os = "linux")]
+    {
+        let ratio = linux_window::vertical_drag_end(&app, moved);
+        DRAGGING.store(false, std::sync::atomic::Ordering::SeqCst);
+        let _ = app.emit("move_end", moved);
+        return ratio;
+    }
+    #[allow(unreachable_code)] None
+}
+
+#[tauri::command]
 fn drag_begin(app: AppHandle) {
+    if cfg!(target_os = "linux") { return; }
     if DRAGGING.swap(true, std::sync::atomic::Ordering::SeqCst) {
         return;
     }
@@ -963,7 +1013,7 @@ const LEAVE_MS: u64 = 300;
 /// ordering is load-bearing: the window ignores the cursor while it is click-through, so the page
 /// gets no mousemove out there and cannot see the pointer arriving. This loop does, and hands the
 /// window its input back in time for the page to open the card.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn start_pointer_watchdog(app: AppHandle) {
     std::thread::spawn(move || {
         let need = (LEAVE_MS / WATCHDOG_MS).max(1) as u8;
@@ -1018,7 +1068,7 @@ fn start_pointer_watchdog(app: AppHandle) {
         }
     });
 }
-#[cfg(not(windows))]
+#[cfg(all(not(windows), not(target_os = "linux")))]
 fn start_pointer_watchdog(_app: AppHandle) {}
 
 /// Log channel for the page: JS writes key diagnostics into run.log (if invoke itself fails, the page reports on screen instead)
@@ -1378,6 +1428,7 @@ pub fn apply_visibility(app: &AppHandle) {
     let _ = app.emit("ui_flags", flags);
     if let Some(w) = app.get_webview_window("notch") {
         if notch {
+            #[cfg(not(target_os = "linux"))]
             let _ = w.show();
             place_notch(app);
         } else {
@@ -1449,6 +1500,7 @@ fn get_notch_insets() -> [f64; 4] {
 /// Which screen edge the notch is pinned to.
 #[tauri::command]
 fn get_notch_edge(app: AppHandle) -> String {
+    if cfg!(target_os = "linux") { return "right".into(); }
     let st = app.state::<AppState>();
     let c = st.cfg.lock().unwrap();
     config::edge_or_right(&c.notch_edge)
@@ -1458,6 +1510,7 @@ fn get_notch_edge(app: AppHandle) -> String {
 /// never been slid along it — each edge keeps its own place, as on the Mac.
 #[tauri::command]
 fn set_notch_edge(app: AppHandle, edge: String) -> String {
+    if cfg!(target_os = "linux") { place_notch(&app); return "right".into(); }
     let value = {
         let st = app.state::<AppState>();
         let mut c = st.cfg.lock().unwrap();
@@ -1808,7 +1861,10 @@ fn main() {
             // Opening Codenotch again while it runs brings Settings forward, as on the Mac: with the
             // tray icon hidden it is the way back. Logged too, for a rebuild that was not picked up.
             applog(&format!("single instance: another launch was refused; the running instance is build={BUILD} — quit it from the tray first if you just rebuilt"));
+            #[cfg(not(target_os = "linux"))]
             settings_window::open(app);
+            #[cfg(target_os = "linux")]
+            let _ = app;
         }))
         .manage(AppState {
             store: Mutex::new(Default::default()),
@@ -1874,6 +1930,9 @@ fn main() {
             set_notch_monitor,
             open_settings,
             begin_move,
+            linux_vertical_drag_begin,
+            linux_vertical_drag_update,
+            linux_vertical_drag_end,
             get_move_handle,
             set_move_handle,
             dropzones::get_zones,
@@ -1888,6 +1947,7 @@ fn main() {
                 crate::platform::configure_notch_window(&w);
             }
             place_notch(&handle);
+            #[cfg(not(target_os = "linux"))]
             if let Some(w) = handle.get_webview_window("notch") {
                 let _ = w.show();
             }
@@ -1914,7 +1974,10 @@ fn main() {
             let gh = handle.clone();
             std::thread::spawn(move || reload_glyphs(&gh));
             start_pointer_watchdog(handle.clone());
+            #[cfg(not(target_os = "linux"))]
             start_work_area_watch(handle.clone());
+            #[cfg(target_os = "linux")]
+            linux_window::start(handle.clone());
             // Seen-clears-it scan
             let acker = handle.clone();
             std::thread::spawn(move || {
@@ -2125,6 +2188,15 @@ mod tests {
     fn the_transparent_area_beside_the_pill_is_not() {
         assert!(!cursor_in_hot(&[PILL], 0.0, 297.0, WINDOW));
         assert!(!cursor_in_hot(&[PILL], 100.0, 400.0, WINDOW));
+    }
+
+    #[test]
+    fn linux_page_starts_collapsed_with_only_the_tab_hot() {
+        let page = include_str!("../ui/notch.html");
+        assert!(page.contains("<body class=\"folded\">"));
+        assert!(page.contains("folded=true"));
+        assert!(page.contains("rects:[rectOf(document.getElementById('rest'))],expanded:false"));
+        assert!(page.contains("callq('set_hot',{rects,expanded:true})"));
     }
 
     #[test]
